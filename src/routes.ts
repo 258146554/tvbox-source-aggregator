@@ -3,7 +3,8 @@
 import { Hono } from 'hono';
 import type { Storage } from './storage/interface';
 import type { AppConfig, SourceEntry, MacCMSSourceEntry, LiveSourceEntry, NameTransformConfig, EdgeProxyConfig } from './core/types';
-import { KV_MERGED_CONFIG, KV_MERGED_CONFIG_FULL, KV_MANUAL_SOURCES, KV_LAST_UPDATE, KV_MACCMS_SOURCES, KV_LIVE_SOURCES, KV_BLACKLIST, LIVE_PROXY_TTL, IMG_PROXY_TTL, KV_INLINE_PREFIX, KV_NAME_TRANSFORM, KV_CRON_INTERVAL, DEFAULT_CRON_INTERVAL, KV_SOURCE_HEALTH, KV_SPEED_TEST_ENABLED, KV_EDGE_PROXIES, KV_SEARCH_QUOTA_REPORT } from './core/config';
+import { KV_MERGED_CONFIG, KV_MERGED_CONFIG_FULL, KV_MANUAL_SOURCES, KV_LAST_UPDATE, KV_MACCMS_SOURCES, KV_LIVE_SOURCES, KV_BLACKLIST, LIVE_PROXY_TTL, IMG_PROXY_TTL, KV_INLINE_PREFIX, KV_NAME_TRANSFORM, KV_CRON_INTERVAL, DEFAULT_CRON_INTERVAL, KV_SOURCE_HEALTH, KV_SPEED_TEST_ENABLED, KV_EDGE_PROXIES, KV_SEARCH_QUOTA_REPORT, KV_AGG_LOGS, KV_BG_SETTINGS, KV_DEDUP_CONFIG } from './core/config';
+import { loadGroupOrder, saveGroupOrder } from './core/group-order';
 import { parseConfigJson, isMultiRepoConfig, extractMultiRepoEntries } from './core/fetcher';
 import { decodeConfigResponse } from './core/decoder';
 import { validateMacCMS } from './core/maccms';
@@ -18,7 +19,8 @@ import { loadCredentials, saveCredential, deleteCredential, loadCredentialPolicy
 import { generateQR, pollQRStatus, passwordLogin, PLATFORM_NAMES, QR_PLATFORMS, PASSWORD_PLATFORMS } from './core/cloud-login';
 import { assessAllSources } from './core/credential-risk';
 import { generateTokenJson } from './core/credential-injector';
-import type { TVBoxConfig, SearchQuotaConfig, CloudPlatform, CloudCredential } from './core/types';
+import { formatLiveGroupsAsTxt } from './core/live-merger';
+import type { TVBoxConfig, SearchQuotaConfig, CloudPlatform, CloudCredential, TVBoxLiveGroup } from './core/types';
 import { mountChannelProbeRoutes } from './routes/channel-probe-admin';
 
 export interface AppDeps {
@@ -27,6 +29,27 @@ export interface AppDeps {
   triggerRefresh: () => Promise<void>;
   onCronIntervalChange?: (intervalMinutes: number) => void;
   enableChannelProbe?: boolean; // 仅 Node/Docker 入口启用
+}
+
+function isNativeLiveGroups(lives: unknown): lives is TVBoxLiveGroup[] {
+  if (!Array.isArray(lives)) return false;
+
+  return lives.every((live) => {
+    if (!live || typeof live !== 'object') return false;
+
+    const group = (live as { group?: unknown }).group;
+    const channels = (live as { channels?: unknown }).channels;
+    if (typeof group !== 'string' || !Array.isArray(channels)) return false;
+
+    return channels.every((channel) => {
+      if (!channel || typeof channel !== 'object') return false;
+      const name = (channel as { name?: unknown }).name;
+      const urls = (channel as { urls?: unknown }).urls;
+      return typeof name === 'string'
+        && Array.isArray(urls)
+        && urls.every((url) => typeof url === 'string');
+    });
+  });
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -61,11 +84,55 @@ export function createApp(deps: AppDeps): Hono {
 
     try {
       const full = JSON.parse(cached);
+      const lives = full.lives || [];
+
+      // CF 模式可能仍保留 FongMi live entries（type/url/api），此时保持旧 JSON 输出兼容。
+      if (!isNativeLiveGroups(lives)) {
+        const liveConfig = { lives };
+        return c.body(JSON.stringify(liveConfig), 200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'public, max-age=1800',
+          'Access-Control-Allow-Origin': '*',
+        });
+      }
+
+      return c.body(formatLiveGroupsAsTxt(lives), 200, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'public, max-age=1800',
+        'Access-Control-Allow-Origin': '*',
+      });
+    } catch {
+      return c.json({ error: 'Config parse error' }, 500);
+    }
+  });
+
+  // ─── .json 下载别名 ────────────────────────────────────
+  app.get('/index.json', async (c) => {
+    const cached = await storage.get(KV_MERGED_CONFIG);
+    if (!cached) {
+      return c.json({ error: 'No config available yet.' }, 503);
+    }
+    return c.body(cached, 200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'public, max-age=1800',
+      'Access-Control-Allow-Origin': '*',
+      'Content-Disposition': 'attachment; filename="tvbox-config.json"',
+    });
+  });
+
+  app.get('/live.json', async (c) => {
+    const cached = await storage.get(KV_MERGED_CONFIG);
+    if (!cached) {
+      return c.json({ error: 'No config available yet.' }, 503);
+    }
+    try {
+      const full = JSON.parse(cached);
       const liveConfig = { lives: full.lives || [] };
       return c.body(JSON.stringify(liveConfig), 200, {
         'Content-Type': 'application/json; charset=utf-8',
         'Cache-Control': 'public, max-age=1800',
         'Access-Control-Allow-Origin': '*',
+        'Content-Disposition': 'attachment; filename="tvbox-live.json"',
       });
     } catch {
       return c.json({ error: 'Config parse error' }, 500);
@@ -1328,6 +1395,123 @@ export function createApp(deps: AppDeps): Hono {
     await saveBlacklist(storage, blacklist);
 
     return c.json({ success: true });
+  });
+
+  // ─── 聚合日志 ──────────────────────────────────────────
+  app.get('/admin/agg-logs', async (c) => {
+    if (!verifyAdmin(c.req.raw, config)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    const raw = await storage.get(KV_AGG_LOGS);
+    const logs = raw ? JSON.parse(raw) : [];
+    const limitStr = c.req.query('limit');
+    const limit = limitStr ? Math.min(parseInt(limitStr) || 20, 50) : 20;
+    const sliced = logs.slice(-limit).reverse();
+    return c.json({ total: logs.length, logs: sliced });
+  });
+
+  app.delete('/admin/agg-logs', async (c) => {
+    if (!verifyAdmin(c.req.raw, config)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    await storage.put(KV_AGG_LOGS, '[]');
+    return c.json({ success: true });
+  });
+
+  // ─── 分组排序 ──────────────────────────────────────────
+  app.get('/admin/group-order', async (c) => {
+    if (!verifyAdmin(c.req.raw, config)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    const cfg = await loadGroupOrder(storage);
+    return c.json(cfg);
+  });
+
+  app.put('/admin/group-order', async (c) => {
+    if (!verifyAdmin(c.req.raw, config)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    let body: { rules?: unknown; unmatchedPosition?: string; enabled?: boolean };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON' }, 400);
+    }
+    const cfg = {
+      rules: Array.isArray(body.rules) ? body.rules : [],
+      unmatchedPosition: (body.unmatchedPosition === 'before' ? 'before' : 'after') as 'before' | 'after',
+      enabled: body.enabled !== false,
+    };
+    await saveGroupOrder(storage, cfg);
+    return c.json({ success: true, ...cfg });
+  });
+
+  // ─── 去重配置 ──────────────────────────────────────────
+  app.get('/admin/dedup-config', async (c) => {
+    if (!verifyAdmin(c.req.raw, config)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    const raw = await storage.get(KV_DEDUP_CONFIG);
+    if (!raw) {
+      return c.json({ similarDedup: true, similarDedupThreshold: 0.85 });
+    }
+    try {
+      return c.json(JSON.parse(raw));
+    } catch {
+      return c.json({ similarDedup: true, similarDedupThreshold: 0.85 });
+    }
+  });
+
+  app.put('/admin/dedup-config', async (c) => {
+    if (!verifyAdmin(c.req.raw, config)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    let body: { similarDedup?: boolean; similarDedupThreshold?: number };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON' }, 400);
+    }
+    const cfg = {
+      similarDedup: body.similarDedup !== false,
+      similarDedupThreshold: typeof body.similarDedupThreshold === 'number'
+        ? Math.max(0.5, Math.min(1.0, body.similarDedupThreshold))
+        : 0.85,
+    };
+    await storage.put(KV_DEDUP_CONFIG, JSON.stringify(cfg));
+    return c.json({ success: true, ...cfg });
+  });
+
+  // ─── 背景设置 ──────────────────────────────────────────
+  app.get('/api/bg-settings', async (c) => {
+    const raw = await storage.get(KV_BG_SETTINGS);
+    if (!raw) return c.json({ type: 'default' });
+    try {
+      return c.json(JSON.parse(raw));
+    } catch {
+      return c.json({ type: 'default' });
+    }
+  });
+
+  app.put('/admin/bg-settings', async (c) => {
+    if (!verifyAdmin(c.req.raw, config)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    let body: { type?: string; imageUrl?: string; overlay?: number; solidColor?: string; gradient?: string };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON' }, 400);
+    }
+    const cfg = {
+      type: body.type || 'default',
+      imageUrl: body.imageUrl || '',
+      overlay: typeof body.overlay === 'number' ? Math.max(0, Math.min(100, body.overlay)) : 85,
+      solidColor: body.solidColor || '#0a0e14',
+      gradient: body.gradient || '',
+    };
+    await storage.put(KV_BG_SETTINGS, JSON.stringify(cfg));
+    return c.json({ success: true, ...cfg });
   });
 
   // ─── 刷新 ─────────────────────────────────────────────
